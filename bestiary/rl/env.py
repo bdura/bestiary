@@ -1,56 +1,143 @@
-from itertools import product
+from typing import Union
 
 import numpy as np
 
 
-class SourdoughEnvironment(object):
+def collapse(angle: Union[float, np.ndarray]):
+    """
+    Collapses an angle to the ]-pi, pi] interval
 
-    def __init__(self, size: int = 100, energy: float = .2, beacon: int = 10):
+    Parameters
+    ----------
+    angle: Angle to collapse
 
-        self.size = size
-        self.beacon = beacon
+    Returns
+    -------
+    angle: Collapsed angle.
 
-        self.offset = 2
+    Examples
+    --------
+    >>> collapse(3 * np.pi / 2) / np.pi
+    0.5
+    """
+    angle %= (2 * np.pi)
+    angle -= (angle > np.pi) * np.pi * 2
+    return angle
 
-        self.beacon_position = np.random.choice([int(beacon * self.offset), size - int(beacon * self.offset)], size=2,
-                                                replace=True)
-        self.energy = energy
 
-        self.mask_ = None
+def unit(alpha):
+    return np.stack((np.cos(alpha), np.sin(alpha))).T
 
-        self.directions_ = {
-            str(np.array([int(beacon * self.offset), int(beacon * self.offset)])): np.array([1, 0]),
-            str(np.array([int(beacon * self.offset), size - int(beacon * self.offset)])): np.array([0, -1]),
-            str(np.array([size - int(beacon * self.offset), int(beacon * self.offset)])): np.array([0, 1]),
-            str(np.array([size - int(beacon * self.offset), size - int(beacon * self.offset)])): np.array([-1, 0])
-        }
-        self.direction_ = self.directions_[str(self.beacon_position)]
+
+class Sourdough(object):
+
+    def __init__(self, energy_mu: float = 1, energy_bw: float = 5.,
+                 n_initial: int = 1 - 00, n_max: int = 100000, stride: float = 1.,
+                 mutation_rate: float = 1e-1, depletion_rate: float = .1, max_exchange_rate: float = .1,
+                 beacon_stride: float = 1., alpha_var: float = .1, alpha_mu: float = .05):
+        self.beacon_position = np.random.uniform(-10, 10, size=2)
+        self.beacon_alpha = np.random.uniform(- np.pi, np.pi)
+        self.beacon_stride = beacon_stride
+        self.alpha_mu = alpha_mu
+        self.alpha_var = alpha_var
+
+        self.energy_mu = energy_mu
+        self.energy_bw = energy_bw
+
+        self.position = np.random.uniform(-10, 10, size=(n_max, 2))
+        self.direction = np.random.uniform(- np.pi, np.pi, size=n_max)
+
+        self.energy = np.ones(n_max) * .5 * (np.arange(n_max) < n_initial)
+
+        # Actions: \alpha < - \pi / 4, \alpha \in [-\pi / 4, \pi / 4], \alpha > \pi / 4
+        self.q = np.random.randn(n_max, 3, 3)  # N x D x A
+
+        self.stride = stride
+
+        self.mutation_rate = mutation_rate
+        self.depletion_rate = depletion_rate
+
+        self.max_exchange_rate = max_exchange_rate
 
     @property
-    def mask(self):
-        if self.mask_ is None:
-            self.mask_ = np.zeros((2 * self.beacon + 1, 2 * self.beacon + 1))
-            for i, j in product(range(2 * self.beacon + 1), range(2 * self.beacon + 1)):
-                if np.sqrt((i - self.beacon) ** 2 + (j - self.beacon) ** 2) < self.beacon:
-                    self.mask_[i, j] = 1
-        return self.mask_
+    def alive(self):
+        return self.energy > 1e-6
+
+    def move_beacon(self):
+        self.beacon_alpha += np.random.normal(self.alpha_mu, scale=self.alpha_var)
+        self.beacon_alpha = collapse(self.beacon_alpha)
+        e = np.array([np.cos(self.beacon_alpha), np.sin(self.beacon_alpha)])
+        self.beacon_position = self.beacon_position + np.random.uniform(0, self.beacon_stride) * e
+
+    def bacteria_angle(self):
+        position = self.position[self.alive]
+        direction = self.direction[self.alive]
+
+        x, y = (self.beacon_position - position).T
+        np.arctan2(y, x)
+
+        alpha = collapse(np.arctan2(y, x) - direction)
+
+        return alpha
+
+    def bacteria_quadrant(self):
+        angle = self.bacteria_angle()
+        action = -1 * (angle < - np.pi / 4) + 1 * (angle > np.pi / 4) + 1
+        return action
+
+    def mitose(self):
+        mitose = self.energy > 1
+        n = mitose.sum()
+
+        if n == 0:
+            return
+
+        dead = np.argsort(self.energy)[:n]
+
+        self.energy[mitose] = .5
+        self.energy[dead] = .5
+
+        self.q[dead] = self.q[mitose]
+        self.position[dead] = self.position[mitose]
+
+        self.direction[dead] = np.random.uniform(0, 2 * np.pi)
+        self.direction[mitose] = np.random.uniform(0, 2 * np.pi)
+
+    def energise(self):
+        position = self.position[self.alive]
+        distance = np.linalg.norm(position - self.beacon_position, axis=1)
+
+        energy = self.energy_mu * np.exp(- distance ** 2 / self.energy_bw)
+
+        self.energy[self.alive] += energy
+
+    def deplete(self):
+        self.energy[self.alive] -= self.depletion_rate
+
+    def mutate(self):
+        self.q[self.alive] += np.random.normal(0, self.mutation_rate, size=(self.alive.sum(), 3, 3))
+
+    def move(self):
+        quadrant = self.bacteria_quadrant()
+        q = collapse_index(self.q[self.alive], quadrant)
+        action = q.argmax(axis=1) - 1
+
+        self.direction[self.alive] += np.random.uniform(0, np.pi) * action
+
+        e = unit(self.direction[self.alive])
+        self.position[self.alive] += e * np.random.uniform(0, self.stride)
 
     def step(self):
+        self.move_beacon()
+        self.energise()
+        self.mitose()
+        self.mutate()
+        self.move()
+        self.deplete()
 
-        self.direction_ = self.directions_.get(str(self.beacon_position), self.direction_)
-
-        self.beacon_position += self.direction_
-        # self.beacon_position = self.beacon_position.clip(self.beacon, self.size - self.beacon - 1)
-
-        energy = np.zeros((self.size, self.size))
-
-        x, y = self.beacon_position
-        energy[x - self.beacon:x + self.beacon + 1, y - self.beacon:y + self.beacon + 1] = self.energy * self.mask
-
-        return energy
-
-    def reset(self):
-        self.beacon_position = (self.size // 2, self.size // 2)
+    def test(self):
+        self.move_beacon()
+        self.move()
 
 
 def select_index(array: np.ndarray, indices: np.ndarray):
@@ -107,116 +194,3 @@ def collapse_index(array: np.ndarray, indices: np.ndarray):
         out[i] = out_
 
     return out
-
-
-class SourdoughAgents(object):
-
-    def __init__(self, n_initial: int = 10, n_max: int = 1000, size: int = 100,
-                 mutation_rate: float = 1e-2, depletion_rate: float = .1, max_exchange_rate: float = .1):
-
-        self.size_ = size
-
-        self.directions_ = np.array([
-            [1, 0],
-            [0, 1],
-            [-1, 0],
-            [0, -1],
-        ])
-
-        self.position = np.random.choice(size, size=(n_max, 2))
-        self.direction = np.random.choice(4, size=n_max)
-
-        self.energy = np.ones(n_max) * .5 * (np.arange(n_max) < n_initial)
-        self.q = np.random.randn(n_max, 2, 3)
-
-        self.mutation_rate = mutation_rate
-        self.depletion_rate = depletion_rate
-
-        self.max_exchange_rate = max_exchange_rate
-
-    def mitose(self):
-        mitose = self.energy > 1
-        n = mitose.sum()
-
-        if n == 0:
-            return
-
-        dead = np.argsort(self.energy)[:n]
-
-        self.energy[mitose] = .5
-        self.energy[dead] = .5
-
-        self.q[dead] = self.q[mitose]
-        self.position[dead] = self.position[mitose]
-
-        self.direction[dead] = np.random.choice(4, n)
-        self.direction[mitose] = np.random.choice(4, n)
-
-    def energise(self, energy):
-        alive = self.energy > 1e-6
-
-        energy = energy.reshape(-1)
-
-        subset = self.position[alive]
-        indices = subset[:, 0] * self.size_ + subset[:, 1]
-
-        self.energy[alive] += energy.take(indices, axis=0)
-
-        return self.energy[alive]
-
-    def deplete(self):
-        alive = self.energy > 1e-6
-        self.energy[alive] -= self.depletion_rate
-
-    def mutate(self):
-        alive = self.energy > 1e-6
-        self.q[alive] += np.random.randn(alive.sum(), 2, 3) + self.mutation_rate
-
-    def move(self, energy):
-        alive = self.energy > 1e-6
-
-        if alive.sum() == 0:
-            return
-
-        energy = energy.reshape(-1)
-
-        subset = self.position[alive]
-        indices = subset[:, 0] * self.position.shape[1] + subset[:, 1]
-        energy = (1 * (energy.take(indices, axis=0) > 0)).astype(np.int)
-        actions = collapse_index(self.q[alive], energy).argmax(axis=1) - 1
-
-        forward = actions == 0
-        turn = actions != 0
-
-        self.position[alive] += self.directions_[self.direction[alive]] * forward.reshape(-1, 1)
-        self.direction[alive] += actions * turn
-
-        self.position = self.position.clip(0, self.size_ - 1)
-        self.direction = self.direction % 4
-
-    def exchange_(self, indices):
-        shuffle = np.random.choice(indices, replace=True, size=len(indices))
-        self.q[indices] += np.random.uniform(0, self.max_exchange_rate) * (self.q[shuffle] - self.q[indices])
-
-    def exchange(self):
-        alive = self.energy > 1e-6
-
-        indices = np.arange(len(self.position))[alive]
-        position = self.position[indices]
-
-        unique, counts = np.unique(position, return_counts=True)
-
-        for u, c in zip(unique, counts):
-            if c > 1:
-                index = indices[(position == u).all(axis=1)]
-                self.exchange_(index)
-
-    def step(self, environment):
-
-        energy = environment.step()
-        self.energise(energy)
-        self.mitose()
-        self.deplete()
-        self.mutate()
-        self.exchange()
-        self.move(energy)

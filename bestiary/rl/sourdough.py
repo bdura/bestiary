@@ -1,16 +1,10 @@
+from typing import Optional
+
 import numpy as np
 from loguru import logger
 from numba import njit
 from sklearn.neighbors import KDTree
-
-DIRECTIONS = np.array([
-    [1, 0],
-    [-1, 0],
-    [0, 1],
-    [0, -1],
-], dtype=np.int)
-
-DEATH = 1e-5
+from tqdm import tqdm
 
 
 @njit
@@ -87,8 +81,10 @@ class FoodSource(object):
     def move(self):
         self.alpha += np.random.uniform(self.omega / 2, self.omega)
 
-    def food(self, position):
-        center = self.position().reshape(1, -1)
+    def food(self, position, center=None):
+        if center is None:
+            center = self.position()
+        center = center.reshape(1, -1)
         return self.energy * np.exp(- (np.linalg.norm(position - center, axis=1) / self.bandwidth) ** 2)
 
 
@@ -96,7 +92,10 @@ class Ecoli(object):
 
     def __init__(self, size: int = 100, n_max: int = 1000, energy_levels: int = 2,
                  max_food: float = .5, food_levels: int = 3, depletion_rate: float = .05,
-                 mutation_rate: float = .1, bandwidth: float = 5., speed: float = .5):
+                 mutation_rate: float = .1, bandwidth: float = 5., speed: float = .5,
+                 record: bool = False, seed: Optional[int] = None):
+
+        np.random.seed(seed)
 
         self.size_ = size
 
@@ -116,9 +115,12 @@ class Ecoli(object):
 
         self.level_ = np.zeros(n_max)
 
-        self.alive = self.energy > DEATH
+        self.alive = self.energy > 0
 
         self.food_source = FoodSource(size=size, energy=max_food * 1.1, bandwidth=bandwidth, speed=speed)
+
+        self.history_ = []
+        self.record = record
 
     def run(self, indices):
 
@@ -139,7 +141,7 @@ class Ecoli(object):
 
     def deplete(self):
         self.energy -= self.depletion_rate
-        self.alive = self.energy > DEATH
+        self.alive = self.energy > 0
 
         self.level_[~self.alive] = 0
 
@@ -202,9 +204,22 @@ class Ecoli(object):
         self.energy[self.alive] += food[self.alive]
         self.mitose()
         self.deplete()
-        self.mutate()
 
-        self.act(food[self.alive])
+        if self.alive.sum() > 0:
+            self.mutate()
+            self.act(food[self.alive])
+
+        if self.record:
+            record = dict(
+                alive=int(self.alive.sum()),
+                energy=self.energy[self.alive],
+                q=self.q[self.alive],
+                position=self.position[self.alive],
+                direction=self.direction[self.alive],
+                food=self.food_source.position(),
+            )
+
+            self.history_.append(record)
 
     def conjugate(self):
 
@@ -221,10 +236,14 @@ class Ecoli(object):
 
         q[conjugate] += np.random.rand(q[conjugate].shape) * .1 * (q[conjugate_from] - q[conjugate])
 
+    def simulate(self, generations=1000, verbose=False):
+        iterator = range(generations)
 
-if __name__ == '__main__':
-    size = 40
-    colony = Ecoli(size=size, n_max=10000, depletion_rate=.3, max_food=1., bandwidth=5)
+        if verbose:
+            iterator = tqdm(iterator, ascii=True, ncols=100)
 
-    while colony.alive.sum() > 0:
-        colony.step()
+        for _ in iterator:
+            self.step()
+
+            if self.alive.sum() == 0:
+                break

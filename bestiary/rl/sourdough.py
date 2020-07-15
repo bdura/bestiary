@@ -1,5 +1,6 @@
 from typing import Optional
 
+import gym
 import numpy as np
 from loguru import logger
 from numba import njit
@@ -90,7 +91,7 @@ class FoodSource(object):
 
 class Ecoli(object):
 
-    def __init__(self, size: int = 100, n_max: int = 1000, energy_levels: int = 2,
+    def __init__(self, size: int = 10, n_max: int = 1000, energy_levels: int = 2,
                  max_food: float = .5, food_levels: int = 3, depletion_rate: float = .05,
                  mutation_rate: float = .1, bandwidth: float = 5., speed: float = .5,
                  record: bool = False, seed: Optional[int] = None):
@@ -113,6 +114,8 @@ class Ecoli(object):
         self.energy_levels_ = np.linspace(0, .9, energy_levels)
         self.food_levels_ = np.linspace(0, max_food, food_levels)
 
+        self.max_food = max_food
+
         self.level_ = np.zeros(n_max)
 
         self.alive = self.energy > 0
@@ -121,6 +124,10 @@ class Ecoli(object):
 
         self.history_ = []
         self.record = record
+
+    @property
+    def dead(self):
+        return self.alive.sum() == 0
 
     def run(self, indices):
 
@@ -148,6 +155,27 @@ class Ecoli(object):
     def mutate(self):
         self.q[self.alive] += np.random.normal(0, self.mutation_rate, size=self.q[self.alive].shape)
 
+    def conjugate(self):
+
+        if self.alive.sum() <= 1:
+            return []
+
+        position = self.position[self.alive]
+        q = self.q[self.alive]
+
+        tree = KDTree(position)
+
+        d, i = tree.query(position, k=2)
+        distance, nn = d[:, 1], i[:, 1]
+
+        conjugate = distance < 1.
+        # conjugate = np.logical_and(conjugate, np.random.rand(len(conjugate)) > .5)
+        conjugate_from = nn[conjugate]
+
+        q[conjugate] += np.random.rand(*q[conjugate].shape) * .1 * (q[conjugate_from] - q[conjugate])
+
+        return conjugate
+
     def mitose(self):
 
         mitose = self.energy > 1
@@ -173,16 +201,19 @@ class Ecoli(object):
         e = np.digitize(energy, self.energy_levels_) - 1
         f = np.digitize(food, self.food_levels_) - 1
 
-        df = np.clip(f - self.level_[self.alive], -1, 1) + 1
+        df = np.clip(f - self.level_[self.alive], -1, 1).astype(np.int) + 1
         self.level_[self.alive] = f
 
         return e, f, df
 
-    def act(self, food):
+    def observe(self, food):
         energy = self.energy[self.alive]
-        q = self.q[self.alive]
-
         e, f, df = self.discretise(energy, food)
+
+        return e, f, df
+
+    def select_actions(self, e, f, df):
+        q = self.q[self.alive]
 
         q = select_along(q, e)
         q = select_along(q, f)
@@ -190,24 +221,32 @@ class Ecoli(object):
 
         actions = q.argmax(axis=1)
 
+        return actions
+
+    def act(self, actions):
+
         run = stratified_index(self.alive, actions == 0)
         tumble = stratified_index(self.alive, actions == 1)
 
         self.run(run)
         self.tumble(tumble)
 
-    def step(self):
+    def step(self, act=True):
 
         self.food_source.move()
         food = self.food_source.food(self.position)
 
         self.energy[self.alive] += food[self.alive]
         self.mitose()
+        self.conjugate()
         self.deplete()
 
-        if self.alive.sum() > 0:
+        observations = self.observe(food[self.alive])
+
+        if act and self.alive.sum() > 0:
             self.mutate()
-            self.act(food[self.alive])
+            actions = self.select_actions(*observations)
+            self.act(actions)
 
         if self.record:
             record = dict(
@@ -221,20 +260,7 @@ class Ecoli(object):
 
             self.history_.append(record)
 
-    def conjugate(self):
-
-        position = self.position[self.alive]
-        q = self.q[self.alive]
-
-        tree = KDTree(position)
-
-        d, i = tree.query(position, k=2)
-        distance, nn = d[:, 1], i[:, 1]
-
-        conjugate = distance < 1.
-        conjugate_from = nn[conjugate]
-
-        q[conjugate] += np.random.rand(q[conjugate].shape) * .1 * (q[conjugate_from] - q[conjugate])
+        return observations
 
     def simulate(self, generations=1000, verbose=False):
         iterator = range(generations)
@@ -247,3 +273,71 @@ class Ecoli(object):
 
             if self.alive.sum() == 0:
                 break
+
+
+class SourdoughEnvironment(gym.Env):
+
+    def render(self, mode='human'):
+        pass
+
+    def __init__(self, size: int = 100, energy_levels: int = 2, max_food: float = .5,
+                 food_levels: int = 3, depletion_rate: float = .05,
+                 mutation_rate: float = .1, bandwidth: float = 5., speed: float = .5,
+                 record: bool = False, max_steps: int = 200):
+
+        super(SourdoughEnvironment, self).__init__()
+
+        # Gym specs
+        self.action_space = gym.spaces.Discrete(2)
+        self.observation_space = gym.spaces.MultiDiscrete([energy_levels, food_levels, 3])
+
+        self.kwargs = dict(size=size, n_max=1, energy_levels=energy_levels,
+                           max_food=max_food, food_levels=food_levels, depletion_rate=depletion_rate,
+                           mutation_rate=mutation_rate, bandwidth=bandwidth, speed=speed)
+
+        self.ecoli = None
+        self.done_ = True
+
+        self.max_steps = max_steps
+        self.steps = 0
+
+    def unpack_observation(self, observations):
+        e, f, df = observations
+        return e[0], f[0], df[0]
+
+    def pack_action(self, action):
+        return np.array([action])
+
+    def observe(self):
+        obs = self.ecoli.step(act=False)
+        if self.ecoli.dead:
+            return None
+        return self.unpack_observation(obs)
+
+    def reset(self, difficulty=1.):
+        self.ecoli = Ecoli(**self.kwargs)
+        self.ecoli.position = np.random.normal(
+            self.ecoli.food_source.position(),
+            self.ecoli.food_source.bandwidth * difficulty,
+        ).reshape(1, 2)
+
+        self.done_ = False
+        self.steps = 0
+
+        return self.observe()
+
+    def step(self, action):
+
+        self.ecoli.act(self.pack_action(action))
+        obs = self.observe()
+
+        self.done_ = self.ecoli.dead or (0 < self.max_steps < self.steps)
+        reward = self.ecoli.energy[0]
+
+        if self.done_:
+            obs = None
+            reward = 0
+
+        self.steps += 1
+
+        return obs, reward, self.done_, {}

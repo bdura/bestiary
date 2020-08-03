@@ -3,65 +3,10 @@ from typing import Optional
 import gym
 import numpy as np
 from loguru import logger
-from numba import njit
 from sklearn.neighbors import KDTree
 from tqdm import tqdm
 
-
-@njit
-def select_(array, indices):
-    out = np.empty((len(indices), *array.shape[1:]))
-    for i in range(len(indices)):
-        out[i] = array[indices[i]]
-    return out
-
-
-def select(array, indices):
-    indices = indices.reshape(len(indices), -1).astype(int)
-
-    a = select_(array, indices[:, 0])
-
-    for i in indices.T[1:]:
-        a = select_along_(a, i)
-
-    return a
-
-
-@njit
-def select_along_(array, indices):
-    out = np.empty((len(indices), *array.shape[2:]))
-    for i in range(len(indices)):
-        out[i] = array[i, indices[i]]
-    return out
-
-
-def select_along(array, indices):
-    indices = indices.reshape(len(indices), -1).astype(int)
-
-    a = array
-    for i in indices.T:
-        a = select_along_(a, i)
-
-    return a
-
-
-@njit
-def stratified_index_(index, sub_index, out):
-    si = 0
-    for i in range(len(index)):
-
-        if index[i]:
-            out[i] = sub_index[si]
-            si += 1
-        else:
-            out[i] = False
-
-    return out
-
-
-def stratified_index(index, sub_index):
-    out = np.empty((len(index),), dtype=bool)
-    return stratified_index_(index, sub_index, out)
+from bestiary.rl.utils import select_along, stratified_index, MAX_INT
 
 
 class FoodSource(object):
@@ -107,6 +52,8 @@ class Ecoli(object):
         self.direction = np.random.uniform(0, 2 * np.pi, size=n_max)
 
         self.energy = np.ones(n_max) * .5
+
+        self.epsilon = 0
 
         # s = (E, F, dF)
         self.q = np.random.randn(n_max, energy_levels, food_levels, 3, 2)
@@ -168,13 +115,13 @@ class Ecoli(object):
         d, i = tree.query(position, k=2)
         distance, nn = d[:, 1], i[:, 1]
 
-        conjugate = distance < 1.
+        conjugate = distance < 0.2
         # conjugate = np.logical_and(conjugate, np.random.rand(len(conjugate)) > .5)
         conjugate_from = nn[conjugate]
 
         q[conjugate] += np.random.rand(*q[conjugate].shape) * .1 * (q[conjugate_from] - q[conjugate])
 
-        return conjugate
+        return stratified_index(self.alive, conjugate)
 
     def mitose(self):
 
@@ -186,6 +133,7 @@ class Ecoli(object):
         self.energy[dead] = self.energy[mitose]
 
         self.q[dead] = self.q[mitose]
+        self.level_[dead] = self.level_[mitose]
 
         self.position[dead] = self.position[mitose]
         self.direction[dead] = np.random.uniform(0, 2 * np.pi, size=dead.sum())
@@ -195,6 +143,8 @@ class Ecoli(object):
         n = mitose.sum()
         if n > 0:
             logger.info(f"{n} bacteria just mitosed")
+
+        return mitose[self.alive]
 
     def discretise(self, energy, food):
 
@@ -212,14 +162,25 @@ class Ecoli(object):
 
         return e, f, df
 
-    def select_actions(self, e, f, df):
+    def get_q(self, e, f, df):
         q = self.q[self.alive]
 
         q = select_along(q, e)
         q = select_along(q, f)
         q = select_along(q, df)
 
+        return q
+
+    def select_actions(self, e, f, df):
+        q = self.get_q(e, f, df)
+
         actions = q.argmax(axis=1)
+
+        if self.epsilon == 0:
+            return actions
+
+        choice = np.random.choice([0, 1], size=len(actions), p=[self.epsilon, 1 - self.epsilon])
+        actions = choice * actions + (1 - choice) * np.random.choice(2, size=actions.shape)
 
         return actions
 
@@ -240,6 +201,8 @@ class Ecoli(object):
         self.mitose()
         self.conjugate()
         self.deplete()
+
+        self.energy = np.ones_like(self.energy) * .5
 
         observations = self.observe(food[self.alive])
 
@@ -283,9 +246,11 @@ class SourdoughEnvironment(gym.Env):
     def __init__(self, size: int = 100, energy_levels: int = 2, max_food: float = .5,
                  food_levels: int = 3, depletion_rate: float = .05,
                  mutation_rate: float = .1, bandwidth: float = 5., speed: float = .5,
-                 record: bool = False, max_steps: int = 200):
+                 max_steps: int = 200, seed=None):
 
         super(SourdoughEnvironment, self).__init__()
+
+        np.random.seed(seed)
 
         # Gym specs
         self.action_space = gym.spaces.Discrete(2)
@@ -301,11 +266,13 @@ class SourdoughEnvironment(gym.Env):
         self.max_steps = max_steps
         self.steps = 0
 
-    def unpack_observation(self, observations):
+    @staticmethod
+    def unpack_observation(observations):
         e, f, df = observations
         return e[0], f[0], df[0]
 
-    def pack_action(self, action):
+    @staticmethod
+    def pack_action(action):
         return np.array([action])
 
     def observe(self):
@@ -315,7 +282,7 @@ class SourdoughEnvironment(gym.Env):
         return self.unpack_observation(obs)
 
     def reset(self, difficulty=1.):
-        self.ecoli = Ecoli(**self.kwargs)
+        self.ecoli = Ecoli(**self.kwargs, seed=np.random.randint(MAX_INT))
         self.ecoli.position = np.random.normal(
             self.ecoli.food_source.position(),
             self.ecoli.food_source.bandwidth * difficulty,
@@ -331,13 +298,207 @@ class SourdoughEnvironment(gym.Env):
         self.ecoli.act(self.pack_action(action))
         obs = self.observe()
 
+        self.steps += 1
+
         self.done_ = self.ecoli.dead or (0 < self.max_steps < self.steps)
-        reward = self.ecoli.energy[0]
+        reward = 1
 
         if self.done_:
             obs = None
             reward = 0
 
-        self.steps += 1
-
         return obs, reward, self.done_, {}
+
+
+class Bacterium(object):
+
+    def __init__(self, lr: float = 1e-1, gamma: float = .99, genome: Optional[np.ndarray] = None,
+                 q: Optional[np.ndarray] = None, energy_levels: int = 2,
+                 food_levels: int = 3, depletion_rate: float = .05,
+                 mutation_rate: float = .1):
+
+        self.kwargs_ = locals()
+        self.kwargs_.pop("genome")
+        self.kwargs_.pop("q")
+
+        if genome is None:
+            # Energy, near-death, fitness, abundance, gregarious, reproduction
+            genome = np.random.randn(5)
+
+        self.genome = genome
+
+        if q is None:
+            # Energy, near-death, fitness, abundance, gregarious, reproduction
+            q = np.random.randn(energy_levels, food_levels, 3, 2)
+
+        self.q = q
+
+        self.gamma = gamma
+        self.lr = lr
+
+        self.mutation_rate = mutation_rate
+        self.depletion_rate = depletion_rate
+
+    def conjugate(self, other):
+        self.q += np.random.rand(*other.q.shape) * .1 * (other.q - self.q)
+
+    def mutate(self):
+        self.q += np.random.normal(0, self.mutation_rate, size=self.q.shape)
+
+
+class RewardEcoli(Ecoli):
+
+    def __init__(self, n_max: int = 1000, lr: float = 1e-1, gamma: float = .99, epsilon=.05, *args, **kwargs):
+
+        super(RewardEcoli, self).__init__(*args, n_max=n_max, **kwargs)
+
+        # Food, energy, near-death, fitness, abundance, gregarious, reproduction
+        self.genome = np.random.randn(n_max, 7)
+
+        self.gamma = gamma
+        self.lr = lr
+
+        self.e_ = np.zeros(n_max, dtype=np.int)
+        self.f_ = np.zeros(n_max, dtype=np.int)
+        self.df_ = np.zeros(n_max, dtype=np.int)
+        self.a_ = np.zeros(n_max, dtype=np.int)
+
+        self.learning = False
+
+        self.epsilon = epsilon
+
+    @staticmethod
+    def near_death(energy):
+        return energy < 5e-2
+
+    @staticmethod
+    def fitness(energy):
+        return energy > .9
+
+    def abundance(self, food):
+        return food > .9 * self.max_food
+
+    @staticmethod
+    def gregarious(conjugation):
+        return conjugation
+
+    @staticmethod
+    def reproduction(mitose):
+        return mitose
+
+    def reward(self, food, conjugation, mitose):
+        energy = self.energy[self.alive]
+
+        r = np.stack([
+            food,
+            energy,
+            1 * self.near_death(energy),
+            1 * self.fitness(energy),
+            1 * self.abundance(food),
+            1 * self.gregarious(conjugation),
+            1 * self.reproduction(mitose),
+            # np.ones(len(energy)),
+        ], axis=1)
+
+        logger.debug(r.shape)
+
+        return np.sum(self.genome[self.alive] * r, axis=1)
+
+    def mutate(self):
+        self.genome += np.random.normal(0, self.mutation_rate, size=self.genome.shape)
+
+    def mitose(self):
+
+        mitose = self.energy > 1
+        dead = np.argsort(self.energy)[:mitose.sum()]
+        dead = np.isin(np.arange(len(self.position)), dead)
+
+        self.energy[mitose] /= 2
+        self.energy[dead] = self.energy[mitose]
+
+        self.q[dead] = self.q[mitose]
+        self.level_[dead] = self.level_[mitose]
+
+        self.e_[dead] = self.e_[mitose]
+        self.f_[dead] = self.f_[mitose]
+        self.df_[dead] = self.df_[mitose]
+        self.a_[dead] = self.a_[mitose]
+
+        self.position[dead] = self.position[mitose]
+        self.direction[dead] = np.random.uniform(0, 2 * np.pi, size=dead.sum())
+
+        self.alive = np.logical_or(self.alive, dead)
+
+        n = mitose.sum()
+        if n > 0:
+            logger.info(f"{n} bacteria just mitosed")
+
+        return mitose
+
+    def learn(self, new_state, reward, actions):
+        students = np.arange(len(self.alive))[self.alive]
+
+        energy_, food_, food_gradient_ = new_state
+
+        if self.learning:
+
+            s = self.e_[students], self.f_[students], self.df_[students]
+
+            for s, e, f, df, a, e_, f_, df_, r in zip(students, *s, self.a_, *new_state, reward):
+                self.q[s, e, f, df, a] += self.lr * (
+                        (r + self.gamma * self.q[s, e_, f_, df_].max())
+                        - self.q[s, e, f, df, a]
+                )
+
+        else:
+            self.learning = True
+
+        self.e_[self.alive] = energy_
+        self.f_[self.alive] = food_
+        self.df_[self.alive] = food_gradient_
+        self.a_[self.alive] = actions
+
+    def step(self, **kwargs):
+
+        self.food_source.move()
+        food = self.food_source.food(self.position)
+
+        self.energy[self.alive] += food[self.alive]
+        mitose = self.mitose()
+        conjugation = self.conjugate()
+        self.deplete()
+
+        if self.alive.sum() > 0:
+            new_states = self.observe(food[self.alive])
+            actions = self.select_actions(*new_states)
+            reward = self.reward(food[self.alive], conjugation[self.alive], mitose[self.alive])
+
+            self.learn(new_states, reward, actions)
+
+            self.act(actions)
+            self.mutate()
+
+        if self.record:
+            record = dict(
+                alive=int(self.alive.sum()),
+                energy=self.energy[self.alive],
+                q=self.q[self.alive],
+                genome=self.genome[self.alive],
+                position=self.position[self.alive],
+                direction=self.direction[self.alive],
+                food=self.food_source.position(),
+            )
+
+            self.history_.append(record)
+
+    def simulate(self, generations=1000, verbose=False):
+        iterator = range(generations)
+
+        if verbose:
+            iterator = tqdm(iterator, ascii=True, ncols=100)
+
+        for _ in iterator:
+            self.step()
+
+            if self.alive.sum() == 0:
+                break
